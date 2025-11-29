@@ -11,4 +11,4 @@ from .nn import MetricNet, ContextNet
 from .embeddings import TokenMap, LearnableTokenMap
 from .utils import generate_icosphere
 from .losses import holonomy_error_loss
-from .models import contrastive_loss, init_encoder_params, grad, apply_encoder
+from .models import contrastive_loss, init_encoder_params, grad, apply_encoder, RaceCarEncoder
