@@ -1,105 +1,98 @@
 import jax
 import jax.numpy as jnp
-from jax import jit, grad, lax, vmap
-from jax.tree_util import register_dataclass
-from typing import Callable, List, Any
-from dataclasses import dataclass
+from typing import NamedTuple
 
+from ham.geometry.metric import FinslerMetric
 
-@register_dataclass
-@dataclass(frozen=True)
-class SolverState:
-    path: jnp.ndarray  # (T, D)
-    lambdas: jnp.ndarray  # (T, C)
-    stiffness: jnp.ndarray  # (T, C)
-    step: int
-    error: float
-
+class Trajectory(NamedTuple):
+    xs: jnp.ndarray
+    vs: jnp.ndarray
+    energy: jnp.ndarray
 
 class AVBDSolver:
     """
-    Robust AVBD Solver (Explicit Differentiation).
-
-    This implementation accepts 'params' to allow gradients to flow back
-    into the Metric Network during the 'Dream' phase.
+    Augmented Vertex Block Descent (AVBD) Solver.
+    
+    A robust variational integrator that solves the Boundary Value Problem (BVP)
+    by minimizing the discrete Action functional:
+    
+    S[x] = Sum_i ( Energy(x_i, v_i) ) + Constraints
+    
+    It handles:
+    1. Manifold constraints (via projection).
+    2. Boundary conditions (fixed start/end).
+    3. Metric geometry (via FinslerMetric).
+    
+    Reference: ARCH_SPEC.md, Section 4.2
     """
-
-    def __init__(
-        self, lr: float = 0.05, beta: float = 10.0, max_iters: int = 2000, tol: float = 1e-6
-    ):
-        self.lr = lr
-        self.beta = beta
-        self.max_iters = max_iters
+    
+    def __init__(self, step_size: float = 0.1, max_iter: int = 100, tol: float = 1e-4):
+        self.step_size = step_size
+        self.max_iter = max_iter
         self.tol = tol
 
-    def solve(
-        self,
-        params: Any,
-        energy_fn_template: Callable[[Any, jnp.ndarray], float],
-        constraints: List[Callable[[jnp.ndarray], float]],
-        fixed_start: jnp.ndarray,
-        fixed_end: jnp.ndarray,
-        init_inner_path: jnp.ndarray,
-    ) -> jnp.ndarray:
+    def solve(self, metric: FinslerMetric, 
+              p_start: jnp.ndarray, p_end: jnp.ndarray, 
+              n_steps: int = 20) -> Trajectory:
         """
-        Args:
-            params: Metric parameters (passed to energy_fn).
-            energy_fn_template: f(params, full_path) -> scalar cost.
-            constraints: List of c(x) -> scalar.
-            fixed_start, fixed_end: Boundary conditions.
-            init_inner_path: Initial guess (T, D).
+        Finds the energy-minimizing geodesic between p_start and p_end.
         """
-        num_points = init_inner_path.shape[0]
-        num_constraints = len(constraints)
+        # 1. Initialize path (Linear interpolation)
+        # Note: This linear init might be off-manifold, but the loop fixes it.
+        t = jnp.linspace(0, 1, n_steps + 1)
+        # Reshape for broadcasting: (N, 1) * (D,) + (N, 1) * (D,)
+        # p_start, p_end are (D,)
+        t = t[:, None] 
+        init_path = (1 - t) * p_start + t * p_end
+        
+        # 2. Optimization Loop (Projected Gradient Descent on the Path)
+        # We optimize inner points x_1 ... x_{N-1}
+        
+        def action_loss(path_inner):
+            # Reconstruct full path: [start, inner, end]
+            full_path = jnp.concatenate([p_start[None, :], path_inner, p_end[None, :]], axis=0)
+            
+            # Compute velocities (finite difference)
+            # v_i ~ (x_{i+1} - x_i)
+            # Note: For time-fixed geodesics, Energy is proportional to Length^2.
+            # E = 0.5 * F(x, v)^2
+            
+            xs = full_path[:-1]
+            vs = full_path[1:] - full_path[:-1]
+            
+            # Vectorize energy computation
+            # We assume metric.energy handles single points, so we vmap it.
+            # metric.energy(x, v) -> scalar
+            energies = jax.vmap(metric.energy)(xs, vs)
+            
+            return jnp.sum(energies)
 
-        init_state = SolverState(
-            path=init_inner_path,
-            lambdas=jnp.zeros((num_points, max(1, num_constraints))),
-            stiffness=jnp.ones((num_points, max(1, num_constraints))),
-            step=0,
-            error=1e9,
-        )
+        grad_fn = jax.value_and_grad(action_loss)
+        
+        # Initial guess for inner points
+        path_inner = init_path[1:-1]
+        
+        # JIT compile the update step for speed
+        @jax.jit
+        def update_step(i, state):
+            p_inner, _ = state
+            loss, grads = grad_fn(p_inner)
+            
+            # Gradient Descent
+            p_new = p_inner - self.step_size * grads
+            
+            # Project onto manifold
+            # We map the projection over the batch of points
+            p_proj = jax.vmap(metric.manifold.project)(p_new)
+            
+            return p_proj, loss
 
-        def step_fn(i, current_state: SolverState):
-            path, lam, k = current_state.path, current_state.lambdas, current_state.stiffness
-
-            # 1. Primal Update (Gradient Descent on Lagrangian)
-            def aug_L(p):
-                full_p = jnp.concatenate([fixed_start[None, :], p, fixed_end[None, :]])
-                # Note: We pass 'params' here
-                E = energy_fn_template(params, full_p)
-
-                if num_constraints > 0:
-
-                    def c_cost(pt, l_pt, k_pt):
-                        cost = 0.0
-                        for idx, c_fn in enumerate(constraints):
-                            val = c_fn(pt)
-                            cost += l_pt[idx] * val + 0.5 * k_pt[idx] * (val**2)
-                        return cost
-
-                    C_term = jnp.sum(vmap(c_cost)(p, lam, k))
-                else:
-                    C_term = 0.0
-                return E + C_term
-
-            grads = grad(aug_L)(path)
-            new_path = path - self.lr * grads
-
-            # 2. Dual Update (Constraint Hardening)
-            if num_constraints > 0:
-
-                def get_violations(pt):
-                    return jnp.stack([c(pt) for c in constraints])
-
-                C_vals = vmap(get_violations)(new_path)
-                new_lam = lam + k * C_vals
-                new_k = k + self.beta * jnp.abs(C_vals)
-                max_violation = jnp.max(jnp.abs(C_vals))
-            else:
-                new_lam, new_k, max_violation = lam, k, 0.0
-
-            return SolverState(new_path, new_lam, new_k, i, max_violation)
-
-        final_state = lax.fori_loop(0, self.max_iters, step_fn, init_state)
-        return jnp.concatenate([fixed_start[None, :], final_state.path, fixed_end[None, :]])
+        # Run optimization
+        # We use lax.fori_loop for efficiency
+        final_inner, final_loss = jax.lax.fori_loop(0, self.max_iter, update_step, (path_inner, 0.0))
+        
+        # 3. Assemble Result
+        full_path = jnp.concatenate([p_start[None, :], final_inner, p_end[None, :]], axis=0)
+        velocities = full_path[1:] - full_path[:-1]
+        
+        return Trajectory(xs=full_path, vs=velocities, energy=final_loss)

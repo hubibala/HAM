@@ -1,126 +1,80 @@
-# HAM: Holonomic Association Model
+# HAMTools: Holonomic Association Models & Finsler Geometry
 
-A modern Python library for differential geometry and deep learning on manifolds.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![JAX](https://img.shields.io/badge/backend-JAX-green.svg)](https://github.com/google/jax)
 
-## Features
+**HAMTools** is a rigorous, differentiable library for **Finsler Geometry**, built on JAX. It treats geometric metrics as learnable neural networks ("Generative Geometry"), enabling applications in Model-Based RL, Physics Discovery, and Representation Learning.
 
-- **Manifold Implementations**: Sphere, hyperbolic spaces, and custom manifolds
-- **Finsler Geometry**: Support for direction-dependent metrics
-- **Deep Learning Integration**: Compatible with PyTorch and JAX
-- **Type Hints**: Fully typed for better IDE support and code quality
+> **Note:** This is the v1.0 Core Infrastructure ("The Rocket Engine"). 
+> For the experimental World Model research code (v0.x), see the [`legacy/`](legacy/) directory.
 
-## Installation
+## 🚀 Key Features
 
-### Basic Installation
+* **Metric-First Design:** Define $F(x, v)$, and the library automatically derives Geodesics, Sprays, and Curvature via Auto-Differentiation.
+* **Implicit Dynamics:** Uses `jax.grad` and `jax.jvp` to solve Euler-Lagrange equations without expanding Christoffel symbols ($O(N^3)$ avoided).
+* **Berwald Transport:** Native parallel transport for non-Riemannian (asymmetric) spaces.
+* **The Zoo:** Verified implementations of **Euclidean**, **Riemannian**, and **Randers** (Zermelo) metrics.
 
-```bash
-pip install ham
-```
-
-### Development Installation
-
-```bash
-git clone https://github.com/yourusername/ham.git
-cd ham
-pip install -e ".[dev]"
-```
-
-### With Deep Learning Frameworks
+## 📦 Installation
 
 ```bash
-# For PyTorch support
-pip install "ham[torch]"
-
-# For JAX support
-pip install "ham[jax]"
-
-# Install everything
-pip install "ham[all]"
+pip install -e .
 ```
 
-## Quick Start
+⚡ Quick Start
+1. Define a Metric
 
 ```python
-import numpy as np
-from ham.manifolds import Sphere
+import jax.numpy as jnp
+from ham.geometry import Randers, Manifold
 
-# Create a 2-sphere (surface of a ball in 3D)
-sphere = Sphere(dim=2)
+# Define the underlying space (e.g., a Plane)
+class Plane(Manifold):
+    @property
+    def ambient_dim(self): return 2
+    @property
+    def intrinsic_dim(self): return 2
+    def project(self, x): return x
+    def to_tangent(self, x, v): return v
+    def random_sample(self, key, shape): return jax.random.normal(key, shape + (2,))
 
-# Points on the sphere
-x = np.array([1.0, 0.0, 0.0])
-y = np.array([0.0, 1.0, 0.0])
+# Define the fields (Neural Networks or Analytical)
+h_net = lambda x: jnp.eye(2)             # The "Sea" (Riemannian)
+w_net = lambda x: jnp.array([0.5, 0.0])  # The "Wind" (Drift)
 
-# Compute the logarithmic map (tangent vector from x to y)
-v = sphere.log(x, y)
-
-# Compute the exponential map (move along the tangent vector)
-z = sphere.exp(x, v)
-
-print(f"Distance approximation: {np.linalg.norm(v)}")
+# Instantiate the Geometry
+metric = Randers(Plane(), h_net, w_net)
 ```
 
-## Project Structure
+2. Solve for Geodesics
+```python
+from ham.solvers import AVBDSolver
+
+solver = AVBDSolver(step_size=0.1)
+start = jnp.array([0., 0.])
+end   = jnp.array([1., 1.])
+
+# Find the energy-minimizing path
+traj = solver.solve(metric, start, end, n_steps=20)
+print(f"Path Cost: {traj.energy}")
+📂 Repository Structure
+src/ham/geometry: Core manifold and metric definitions.
+
+src/ham/solvers: Variational geodesic solvers (AVBD).
+
+tests/: Rigorous unit tests verifying mathematical correctness (Zermelo navigation, Isometries).
+
+legacy/: Archived research code from the initial "World Model" experiments.
+
+📝 Citation
+If you use HAMTools in your research:
 
 ```
-src/
-└── ham/
-    ├── __init__.py
-    ├── manifolds/          # Manifold implementations
-    │   ├── base.py         # Abstract base class
-    │   └── sphere.py       # Sphere manifold
-    └── geometry/           # Geometric structures
-        └── finsler.py      # Finsler metrics
-```
-
-## Development
-
-### Running Tests
-
-```bash
-pytest
-```
-
-### Code Formatting
-
-```bash
-black src/
-isort src/
-```
-
-### Type Checking
-
-```bash
-mypy src/
-```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-MIT License
-
-## Citation
-
-If you use this library in your research, please cite:
-
-```bibtex
-@software{ham2025,
-  title={HAM: Holonomic Association Model},
-  author={Your Name},
-  year={2025},
-  url={https://github.com/yourusername/ham}
+@software{hamtools2025,
+  author = {HAM Research Team},
+  title = {HAMTools: Differentiable Finsler Geometry in JAX},
+  year = {2025},
+  url = {[https://github.com/hubibala/ham](https://github.com/hubibala/ham)}
 }
 ```
-
-## Roadmap
-
-- [ ] Hyperbolic space implementations (Poincaré ball, hyperboloid)
-- [ ] Product manifolds
-- [ ] Parallel transport
-- [ ] Geodesic computations
-- [ ] PyTorch and JAX backend integration
-- [ ] Optimization on manifolds (Riemannian gradient descent)
-- [ ] Neural network layers for manifold-valued data

@@ -1,100 +1,66 @@
 import jax
 import jax.numpy as jnp
-from jax import jit, grad, jacfwd, hessian
-from functools import partial
+from ham.geometry.metric import FinslerMetric
 
-# --- 1. FINSLER GEOMETRY KERNEL ---
-
-
-def finsler_energy(theta, x, v, metric_fn):
-    """The Lagrangian L = 0.5 * F(x, v)^2."""
-    g, beta = metric_fn(theta, x)
-
-    # Robust Randers Norm
-    vgv = jnp.dot(v, jnp.dot(g, v))
-    alpha = jnp.sqrt(jnp.maximum(vgv, 1e-9))
-    drift = jnp.dot(beta, v)
-
-    F = alpha + drift
-    return 0.5 * F**2
-
-
-def compute_spray(theta, x, v, metric_fn):
-    """Computes Geodesic Spray G^i via Auto-Diff of Euler-Lagrange."""
-    L = lambda x_, v_: finsler_energy(theta, x_, v_, metric_fn)
-
-    dL_dx = grad(L, argnums=0)(x, v)
-
-    # Hessian w.r.t v
-    H = hessian(L, argnums=1)(x, v)
-    H_inv = jnp.linalg.inv(H + 1e-6 * jnp.eye(x.shape[0]))
-
-    # Mixed Partial d^2L / dv dx
-    M = jacfwd(grad(L, argnums=1), argnums=0)(x, v)
-
-    # Spray Equation: H * a + M * v - dL_dx = 0
-    rhs = dL_dx - jnp.dot(M, v)
-    accel = jnp.dot(H_inv, rhs)
-
-    return -0.5 * accel
-
-
-def compute_berwald_connection(theta, x, v, metric_fn):
-    """Computes Berwald Connection coefficients via Jacobian of Spray."""
-    # Gamma = dG / dv
-    return jacfwd(lambda v_: compute_spray(theta, x, v_, metric_fn))(v)
-
-
-# --- 2. TRANSPORT INTEGRATOR ---
-
-
-def transport_ode_step(w, x, dx, theta, metric_fn, spherical=False):
-    """Evolves vector w along path segment dx."""
-
-    # Reference velocity for connection (direction of path)
-    v_ref = jax.lax.select(jnp.linalg.norm(dx) > 1e-9, dx, jnp.ones_like(dx) * 1e-5)
-
-    # Ambient Berwald Connection
-    # N^i_k = Gamma^i_{jk} dx^j
-    N = compute_berwald_connection(theta, x, dx, metric_fn)
-    dw = -jnp.dot(N, w)
-
-    # Spherical Correction (Only for R3 -> S2 embedding)
-    if spherical:
-        dw_sphere = -jnp.dot(w, dx) * x
-        dw = dw + dw_sphere
-
-    return dw
-
-
-# --- 3. PUBLIC INTERFACE ---
-
-
-# FIX: metric_fn is arg 3, spherical is arg 4. Both must be static.
-@partial(jax.jit, static_argnums=(3, 4))
-def parallel_transport(theta, path, v_init, metric_fn, spherical=False):
+def berwald_transport(metric: FinslerMetric, 
+                      path_x: jnp.ndarray, 
+                      path_v: jnp.ndarray, 
+                      vec_start: jnp.ndarray) -> jnp.ndarray:
     """
-    Finslerian Parallel Transport via Berwald Connection.
+    Parallel transports a vector 'vec_start' along a trajectory (path_x, path_v)
+    using the Berwald Connection.
+    
+    The Berwald connection is induced directly by the Spray G.
+    Equation: dX/dt + Jac_v(G)(x, v) * X = 0
+    
     Args:
-        theta: Metric params
-        path: Sequence of points
-        v_init: Start vector
-        metric_fn: Function f(theta, x) -> (g, beta)
-        spherical: If True, enforces S2 projection (use only for R3 embedding)
+        metric: The Finsler geometry.
+        path_x: Shape (T, D) - Position sequence.
+        path_v: Shape (T, D) - Velocity sequence (tangent to x).
+        vec_start: Shape (D,) - The vector at path_x[0] to transport.
+        
+    Returns:
+        transported_vecs: Shape (T, D) - The vector field along the path.
     """
+    
+    # We define the ODE derivative function for jax.lax.scan
+    def transport_ode(carry_vec, inputs):
+        x, v = inputs # Current position and velocity of the base curve
+        
+        # 1. Compute the Connection Matrix (D, D)
+        # For Berwald: Gamma^i_j = d(G^i)/d(v^j)
+        # We use Jacobian of the spray function w.r.t velocity (arg 1)
+        # Note: G is defined as -0.5 * acceleration. 
+        # The ODE is D_t X = 0 => dX/dt + Gamma * X = 0
+        jac_spray = jax.jacfwd(metric.spray, argnums=1)(x, v)
+        
+        # 2. Compute Derivative of the transported vector
+        # dX = - Gamma * X
+        # The linear connection term for Berwald is Jac_v(G).
+        dx = -jnp.dot(jac_spray, carry_vec)
+        
+        # 3. Update (Euler integration step)
+        # We use a normalized dt = 1.0 / Steps because the spray G is already 
+        # scaled by the energy function's time assumptions.
+        dt = 1.0 / len(path_x)
+        new_vec = carry_vec + dx * dt
+        
+        # 4. Functional Constraint Enforcement
+        # Ensure the vector stays tangent to the manifold.
+        new_vec = metric.manifold.to_tangent(x, new_vec)
+        
+        return new_vec, new_vec
 
-    def scan_fn(v_curr, i):
-        x_curr = path[i]
-        x_next = path[i + 1]
-        dx = x_next - x_curr
-
-        dv = transport_ode_step(v_curr, x_curr, dx, theta, metric_fn, spherical=spherical)
-        v_next = v_curr + dv
-
-        return v_next, v_next
-
-    num_steps = path.shape[0] - 1
-    indices = jnp.arange(num_steps)
-    v_final, _ = jax.lax.scan(scan_fn, v_init, indices)
-
-    return v_final
+    # Run Scan (Efficient Loop)
+    _, transported_vecs = jax.lax.scan(
+        transport_ode, 
+        vec_start, 
+        (path_x, path_v)
+    )
+    
+    # The scan outputs the vector *after* each step. 
+    # We want the sequence starting from vec_start.
+    # We discard the very last projected point to keep shapes consistent (T, D)
+    result = jnp.concatenate([vec_start[None, :], transported_vecs[:-1]], axis=0)
+    
+    return result

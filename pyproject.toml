@@ -3,93 +3,50 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ham"
+name = "hamtools"
 version = "0.1.0"
-description = "Holonomic Association Model: A differential geometry library for deep learning"
+description = "A differentiable library for learnable Finsler Geometry and Holonomic Association Models."
 readme = "README.md"
-requires-python = ">=3.8"
-license = {text = "MIT"}
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+  { name = "HAM Research Team", email = "research@ham.dev" },
 ]
-keywords = ["differential geometry", "deep learning", "manifolds", "Finsler geometry", "Riemannian geometry"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Science/Research",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-
 dependencies = [
-    "jax",
-    "jaxlib",
-    "optax",
-    "equinox",
-    "numpy>=1.24.0",
-    "scipy>=1.10.0",
-    "matplotlib>=3.7.0",
-    "scikit-learn",
+    "jax>=0.4.0",
+    "jaxlib>=0.4.0",
+    "equinox>=0.10.0",
+    "optax>=0.1.0",
+    "numpy",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.4.0",
-    "pytest-cov>=4.0.0",
-    "black>=23.0.0",
-    "flake8>=6.0.0",
-    "mypy>=1.0.0",
-    "isort>=5.12.0",
-]
-notebook = [
-    "jupyter>=1.0.0",
-    "ipykernel>=6.0.0",
-]
-metal = [
-    "jax-metal",
-]
-docs = [
-    "sphinx>=6.0.0",
-    "sphinx-rtd-theme>=1.2.0",
-    "sphinxcontrib-bibtex>=2.5.0",
-]
-all = [
-    "ham[dev,notebook,metal,docs]",
+    "pytest",
+    "pytest-cov",
+    "matplotlib",
+    "jupyter",
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/ham"
-Documentation = "https://ham.readthedocs.io"
-Repository = "https://github.com/yourusername/ham"
-"Bug Tracker" = "https://github.com/yourusername/ham/issues"
+Homepage = "https://github.com/hubibala/ham"
+Bug_Tracker = "https://github.com/hubibala/ham/issues"
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.black]
-line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311']
-include = '\.pyi?$'
-
-[tool.isort]
-profile = "black"
-line_length = 100
-
-[tool.mypy]
-python_version = "3.8"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = false
-ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-addopts = "-v --cov=ham --cov-report=term-missing"
+include = ["ham*"]
+exclude = ["legacy*"]
