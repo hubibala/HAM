@@ -175,3 +175,21 @@ src/
 4. Update avbd.py: Ensure it accepts a generic FinslerMetric object instead of hardcoded logic.
 
 5. Tests: Validate Euclidean spray is zero, Randers spray matches analytical Zermelo.
+
+## 7. Migration Strategy: "Cannibalize and Replatform"
+We will treat the legacy src/ham/ codebase as a reference library to populate the new HAMTools structure.
+- src/ham/geometry/finsler.py $\to$ src/geometry/zoo.py
+    - Action: Harvest Logic.
+    - Detail: Extract the RandersFactory convexity checks (specifically the tanh stabilization) and the Cholesky decomposition logic. Re-implement them within the new RandersMetric class. Discard the old class wrappers.
+- src/ham/solvers/avbd.py $\to$ src/solvers/avbd.py
+    - Action: Keep & Adapt.
+    - Detail: Copy the Primal-Dual update loop and Augmented Lagrangian logic. Refactor the function signatures to accept the new generic FinslerMetric object instead of raw energy functions.
+- src/ham/manifolds/base.py $\to$ src/geometry/manifold.py
+    - Action: Rewrite.
+    - Detail: Implement the cleaner Manifold interface defined in Section 2.1 from scratch.
+- src/ham/experiments/
+    - Action: Discard.
+    - Detail: These are task-specific and not part of the general library.
+- src/ham/models/encoder.py
+    - Action: Archive.
+    - Detail: Do not import into HAMTools.
