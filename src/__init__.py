@@ -5,7 +5,9 @@ from . import geometry
 from . import solvers
 
 from .geometry import Manifold, FinslerMetric
-from .geometry.zoo import Euclidean, Riemannian, Randers
+from .geometry.surfaces import Sphere
+from .geometry.zoo import Euclidean, Riemannian, Randers, PiecewiseConstantFinsler, DiscreteRanders
+from .geometry.mesh import TriangularMesh
 from .solvers import AVBDSolver
 
 def enable_x64():

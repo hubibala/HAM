@@ -4,6 +4,7 @@ from typing import Callable
 
 from ham.geometry.metric import FinslerMetric
 from ham.geometry.manifold import Manifold
+from ham.geometry.mesh import TriangularMesh
 
 class Euclidean(FinslerMetric):
     """
@@ -116,4 +117,65 @@ class Randers(FinslerMetric):
         # "Headwind (opposing W) increases cost."
         cost = (jnp.sqrt(jnp.maximum(discriminant, 1e-8)) - W_dot_v) / lam
         
+        return cost
+
+class PiecewiseConstantFinsler(FinslerMetric):
+    """
+    A metric defined on a mesh where each face has a constant cost coefficient.
+    F(x, v) = cost[face_index] * |v|
+    
+    Useful for modeling terrains with different surfaces (e.g. mud vs road).
+    """
+    def __init__(self, mesh: TriangularMesh, face_costs: jnp.ndarray):
+        """
+        Args:
+            mesh: The TriangularMesh manifold.
+            face_costs: (F,) array of scalar costs for each face.
+        """
+        super().__init__(mesh)
+        self.face_costs = face_costs
+        
+        # Ensure mesh is actually a TriangularMesh
+        if not isinstance(mesh, TriangularMesh):
+            raise ValueError("PiecewiseConstantFinsler requires a TriangularMesh.")
+
+    def metric_fn(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+        # 1. Identify which face x is on
+        # Note: This uses argmin, so gradient w.r.t x through the index is 0.
+        # This is expected for piecewise constant metrics. The solver works
+        # because minimizing the path integral drives x towards lower cost regions.
+        face_idx = self.manifold.get_face_index(x)
+        
+        # 2. Look up cost
+        cost = self.face_costs[face_idx]
+        
+        # 3. Compute metric
+        return cost * jnp.linalg.norm(v)
+
+class DiscreteRanders(FinslerMetric):
+    """
+    Anisotropic Mesh Metric (Wind per face).
+    F(x, v) = Zermelo(v, W_face)
+    """
+    def __init__(self, mesh: TriangularMesh, face_winds: jnp.ndarray, epsilon: float = 1e-5):
+        super().__init__(mesh)
+        self.face_winds = face_winds
+        self.epsilon = epsilon
+        if not isinstance(mesh, TriangularMesh): raise ValueError("Requires TriangularMesh.")
+
+    def metric_fn(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+        face_idx = self.manifold.get_face_index(x)
+        W_raw = self.face_winds[face_idx]
+        
+        # Stabilize Wind
+        w_norm = jnp.linalg.norm(W_raw)
+        scale = (1.0 - self.epsilon) * jnp.tanh(w_norm) / (w_norm + 1e-8)
+        W = W_raw * scale
+        lam = 1.0 - (w_norm * scale)**2
+        
+        v_sq = jnp.dot(v, v)
+        W_dot_v = jnp.dot(W, v)
+        
+        discriminant = lam * v_sq + W_dot_v**2
+        cost = (jnp.sqrt(jnp.maximum(discriminant, 1e-8)) - W_dot_v) / lam
         return cost
