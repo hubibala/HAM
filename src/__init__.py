@@ -10,6 +10,7 @@ from .geometry.zoo import Euclidean, Riemannian, Randers, PiecewiseConstantFinsl
 from .geometry.mesh import TriangularMesh
 from .solvers import AVBDSolver
 from .nn import VectorField, PSDMatrixField
+from .vis import setup_3d_plot, plot_sphere, plot_trajectory, generate_icosphere, plot_indicatrices
 
 def enable_x64():
     config.update("jax_enable_x64", True)
