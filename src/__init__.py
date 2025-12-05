@@ -9,6 +9,7 @@ from .geometry.surfaces import Sphere
 from .geometry.zoo import Euclidean, Riemannian, Randers, PiecewiseConstantFinsler, DiscreteRanders
 from .geometry.mesh import TriangularMesh
 from .solvers import AVBDSolver
+from .nn import VectorField, PSDMatrixField
 
 def enable_x64():
     config.update("jax_enable_x64", True)
