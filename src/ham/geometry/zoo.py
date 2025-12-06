@@ -1,56 +1,34 @@
+
 import jax
 import jax.numpy as jnp
-from typing import Callable
+from typing import Callable, Optional
 
 from ham.geometry.metric import FinslerMetric
 from ham.geometry.manifold import Manifold
 from ham.geometry.mesh import TriangularMesh
+from ham.utils.math import safe_norm
 
 class Euclidean(FinslerMetric):
-    """
-    Standard Euclidean metric: F(x, v) = |v|.
-    Curvature is zero.
-    """
+    """Standard Euclidean metric: F(x, v) = |v|."""
     def metric_fn(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
-        return jnp.linalg.norm(v)
+        return safe_norm(v)
 
 class Riemannian(FinslerMetric):
-    """
-    General Riemannian metric: F(x, v) = sqrt( v^T G(x) v ).
-    Defined by a position-dependent positive-definite matrix G(x).
-    """
+    """General Riemannian metric: F(x, v) = sqrt( v^T G(x) v )."""
     def __init__(self, manifold: Manifold, g_net: Callable[[jnp.ndarray], jnp.ndarray]):
-        """
-        Args:
-            manifold: The underlying domain.
-            g_net: A function (or Neural Network) mapping x -> (D, D) matrix.
-                   Must return a positive-definite matrix.
-        """
         super().__init__(manifold)
         self.g_net = g_net
 
     def metric_fn(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
         G_x = self.g_net(x)
-        # Numerical stability: Ensure symmetry
         G_x = 0.5 * (G_x + G_x.T)
-        
-        # Compute norm
         quad = jnp.dot(v, jnp.dot(G_x, v))
-        return jnp.sqrt(jnp.maximum(quad, 1e-6))
+        return jnp.sqrt(jnp.maximum(quad, 1e-12))
 
 class Randers(FinslerMetric):
     """
-    Randers Metric defined via Zermelo Navigation.
-    F(x, v) = sqrt( |v|_h^2 + <W, v>_h^2 ) - <W, v>_h / lambda
-    
-    where:
-    - h(x): Riemannian metric (The 'Sea')
-    - W(x): Wind field (The 'Current')
-    - lambda = 1 - |W|_h^2
-    
-    Constraint: |W|_h < 1 (Wind must be weaker than the boat's max speed).
-    
-    Reference: MATH_SPEC.md, Section 5
+    Rigorous Randers Metric (Zermelo Navigation).
+    F(x, v) = ( sqrt( lambda |v|_h^2 + <W, v>_h^2 ) - <W, v>_h ) / lambda
     """
     def __init__(self, 
                  manifold: Manifold, 
@@ -63,94 +41,94 @@ class Randers(FinslerMetric):
         self.epsilon = epsilon
 
     def _get_zermelo_data(self, x: jnp.ndarray):
-        """
-        Computes h(x) and W(x), enforcing the convexity constraint |W|_h < 1.
-        Implementation harvested from legacy 'RandersFactory'.
-        """
-        # 1. Get Base Riemannian Metric h(x)
         H = self.h_net(x)
-        H = 0.5 * (H + H.T) # Enforce symmetry
+        H = 0.5 * (H + H.T) 
         
-        # 2. Get Raw Wind W_raw(x)
         W_raw = self.w_net(x)
         
-        # 3. Calculate Wind Norm in metric h
-        # |W|_h^2 = W^T H W
+        # Norm in metric H
         w_norm_sq = jnp.dot(W_raw, jnp.dot(H, W_raw))
         w_norm = jnp.sqrt(w_norm_sq + 1e-8)
         
-        # 4. Stabilize Wind (Convexity Constraint)
-        # We need |W|_h < 1. We use tanh to squash the norm softy.
-        # factor = tanh(w_norm) / w_norm
-        # If w_norm is very small, factor -> 1.
-        # We perform a safe division (or use logic where we just scale if > 1-eps).
-        # The legacy code used: scaled_W = W * (tanh(norm) / norm) * 0.95
-        
-        # Strict enforcement: max_norm = 1.0 - epsilon
-        # scale = (1 - epsilon) * tanh(w_norm) / w_norm
+        # Enforce convexity: ||W|| < 1
         scale = (1.0 - self.epsilon) * jnp.tanh(w_norm) / (w_norm + 1e-8)
-        
         W = W_raw * scale
         
-        # Re-calculate correct norm for lambda
-        # This is safe because we just scaled W
-        w_final_norm_sq = w_norm_sq * (scale**2)
-        lam = 1.0 - w_final_norm_sq
+        # Lambda = 1 - ||W||^2
+        w_final_sq = w_norm_sq * (scale**2)
+        lam = 1.0 - w_final_sq
         
         return H, W, lam
 
     def metric_fn(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
         H, W, lam = self._get_zermelo_data(x)
         
-        # Compute terms
-        # v_norm_h^2 = v^T H v
         v_sq_h = jnp.dot(v, jnp.dot(H, v))
-        
-        # <W, v>_h = v^T H W
         W_dot_v = jnp.dot(v, jnp.dot(H, W))
         
-        # Discriminant: lambda * |v|^2 + <W,v>^2
         discriminant = lam * v_sq_h + W_dot_v**2
-        
-        # F = (sqrt(discriminant) - <W,v>) / lambda
-        # Note: We use minus sign for W term per MATH_SPEC.md Section 5
-        # "Headwind (opposing W) increases cost."
-        cost = (jnp.sqrt(jnp.maximum(discriminant, 1e-8)) - W_dot_v) / lam
-        
+        cost = (jnp.sqrt(jnp.maximum(discriminant, 1e-12)) - W_dot_v) / lam
         return cost
 
 class PiecewiseConstantFinsler(FinslerMetric):
     """
-    A metric defined on a mesh where each face has a constant cost coefficient.
-    F(x, v) = cost[face_index] * |v|
-    
-    Useful for modeling terrains with different surfaces (e.g. mud vs road).
+    Metric on a mesh.
+    If smooth=False: Cost is constant per face. Gradient is 0 (Optimizer won't work!).
+    If smooth=True:  Cost is interpolated from vertices. Gradient exists.
     """
-    def __init__(self, mesh: TriangularMesh, face_costs: jnp.ndarray):
-        """
-        Args:
-            mesh: The TriangularMesh manifold.
-            face_costs: (F,) array of scalar costs for each face.
-        """
+    def __init__(self, mesh: TriangularMesh, face_costs: jnp.ndarray, smooth: bool = True):
         super().__init__(mesh)
-        self.face_costs = face_costs
-        
-        # Ensure mesh is actually a TriangularMesh
         if not isinstance(mesh, TriangularMesh):
-            raise ValueError("PiecewiseConstantFinsler requires a TriangularMesh.")
+            raise ValueError("Requires TriangularMesh.")
+        self.face_costs = face_costs
+        self.smooth = smooth
+        
+        if self.smooth:
+            # Precompute vertex costs by averaging adjacent faces
+            N_v = mesh.vertices.shape[0]
+            v_costs = jnp.zeros(N_v)
+            counts = jnp.zeros(N_v)
+            
+            # Expand face_costs for each vertex of the face
+            flat_indices = mesh.faces.flatten()
+            repeated_costs = jnp.repeat(face_costs, 3)
+            
+            v_costs = v_costs.at[flat_indices].add(repeated_costs)
+            counts = counts.at[flat_indices].add(1.0)
+            
+            self.vertex_costs = v_costs / jnp.maximum(counts, 1.0)
+        else:
+            self.vertex_costs = None
 
     def metric_fn(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
-        # 1. Identify which face x is on
-        # Note: This uses argmin, so gradient w.r.t x through the index is 0.
-        # This is expected for piecewise constant metrics. The solver works
-        # because minimizing the path integral drives x towards lower cost regions.
         face_idx = self.manifold.get_face_index(x)
         
-        # 2. Look up cost
-        cost = self.face_costs[face_idx]
-        
-        # 3. Compute metric
-        return cost * jnp.linalg.norm(v)
+        if self.smooth:
+            # Interpolate cost using barycentric coordinates
+            tri = self.manifold.triangles[face_idx]
+            a, b, c = tri[0], tri[1], tri[2]
+            
+            ab, ac, ap = b - a, c - a, x - a
+            d1, d2 = jnp.dot(ab, ap), jnp.dot(ac, ap)
+            d3, d4, d5 = jnp.dot(ab, ab), jnp.dot(ab, ac), jnp.dot(ac, ac)
+            
+            det = jnp.maximum(d3 * d5 - d4 * d4, 1e-12)
+            s = (d5 * d1 - d4 * d2) / det
+            t = (d3 * d2 - d4 * d1) / det
+            w = 1.0 - s - t
+            
+            face_verts = self.manifold.faces[face_idx]
+            c_a = self.vertex_costs[face_verts[0]]
+            c_b = self.vertex_costs[face_verts[1]]
+            c_c = self.vertex_costs[face_verts[2]]
+            
+            cost = w * c_a + s * c_b + t * c_c
+            cost = jnp.maximum(cost, 1e-2)
+            
+        else:
+            cost = self.face_costs[face_idx]
+            
+        return cost * safe_norm(v)
 
 class DiscreteRanders(FinslerMetric):
     """

@@ -29,7 +29,7 @@ start = jnp.array([1.0, 0.0, 0.0])
 end   = jnp.array([0.0,  0.0, 1.0])
 
 # --- 3. Solve (Continuous) ---
-solver = AVBDSolver(step_size=0.05, max_iter=500)
+solver = AVBDSolver(step_size=0.05, beta=10.0, iterations=200, tol=1e-6)
 
 print("Solving Riemannian (Great Circle)...")
 traj_riem = solver.solve(metric_riem, start, end, n_steps=40)
