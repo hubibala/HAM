@@ -13,8 +13,8 @@ class TestMeshSolver(unittest.TestCase):
     
     def setUp(self):
         # Increased iterations for convergence on sharp geometries
-        # Using the new robust AVBD parameters (beta=10.0 for stiffness)
-        self.solver = AVBDSolver(step_size=0.05, beta=10.0, iterations=200)
+        # Using the new robust AVBD parameters
+        self.solver = AVBDSolver(step_size=0.05, iterations=200)
         self.key = jax.random.PRNGKey(42)
 
     def test_pyramid_surface_constraint(self):
@@ -102,7 +102,7 @@ class TestMeshSolver(unittest.TestCase):
         # Higher iterations needed: the obstacle avoidance geometry with near-singular
         # 0.95 headwind requires more convergence steps to fully deviate the path,
         # especially since the AVBD permutation order is data-dependent.
-        solver_hard = AVBDSolver(step_size=0.05, beta=10.0, iterations=400)
+        solver_hard = AVBDSolver(step_size=0.05, iterations=400)
         
         traj = solver_hard.solve(metric, start, end, n_steps=40)
         

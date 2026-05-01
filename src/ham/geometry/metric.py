@@ -13,6 +13,11 @@ class FinslerMetric(eqx.Module):
     """
     manifold: Manifold
 
+    @property
+    def has_wind(self) -> bool:
+        """Returns True if the metric has an active wind field."""
+        return getattr(self, "use_wind", False)
+
     @abstractmethod
     def metric_fn(self, x: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
         """

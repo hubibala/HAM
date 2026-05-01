@@ -175,7 +175,7 @@ def check_two_segment_energy(vae: GeometricVAE, dataset: BioDataset):
 
 def check_riemannian_baseline(vae: GeometricVAE):
     key       = jax.random.PRNGKey(1)
-    riem_vae  = build_riemannian_baseline(vae, key)
+    riem_vae  = build_riemannian_baseline(vae)
     assert riem_vae.encoder_net is vae.encoder_net or \
            jax.tree_util.tree_leaves(riem_vae.encoder_net) == jax.tree_util.tree_leaves(vae.encoder_net)
     print("  ✓ build_riemannian_baseline OK")

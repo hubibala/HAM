@@ -63,6 +63,9 @@ from ham.geometry.surfaces import EuclideanSpace
 from ham.models.learned import PullbackRiemannian
 from ham.training.losses import LossComponent
 from ham.geometry.zoo import Euclidean
+from ham.utils.math import safe_norm
+import joblib
+import warnings
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -131,6 +134,12 @@ def build_knn_triplet_indices(X_pca: np.ndarray, labels: np.ndarray,
         attempts += 512
 
     triplets = np.array(triplets[:n_triplets], dtype=np.int32)
+    if len(triplets) < n_triplets:
+        warnings.warn(
+            f"Only generated {len(triplets)}/{n_triplets} KNN triplets after "
+            f"{max_attempts} attempts. Check label balance.",
+            RuntimeWarning,
+        )
     print(f"  Generated {len(triplets)} KNN triplets.")
     return triplets
 
@@ -138,7 +147,7 @@ def build_knn_triplet_indices(X_pca: np.ndarray, labels: np.ndarray,
 class KNNTripletLoss(LossComponent):
     """
     Topology-preserving triplet loss.
-    Margin is applied in Euclidean latent distance — no metric needed.
+    Margin is applied in SQUARED Euclidean latent distance — no metric needed.
     batch[0] = anchor PCA coords
     batch[1] = positive PCA coords   (KNN neighbour)
     batch[2] = negative PCA coords   (different-label cell)
@@ -195,14 +204,17 @@ class TrajectoryCoherenceLoss(LossComponent):
         z6 = v_get_dist(x6).mean
 
         # 1. Midpoint coherence (per sample, then mean)
-        z_mid    = 0.5 * (z2 + z6)
-        mid_loss = jnp.mean(jnp.sum((z4 - z_mid) ** 2, axis=-1))
+        # Future-proofed to use manifold operations instead of Euclidean interpolation
+        v_2to6 = model.manifold.log_map(z2, z6)
+        z_mid = model.manifold.exp_map(z2, 0.5 * v_2to6)
+        v_mid = model.manifold.log_map(z_mid, z4)
+        mid_loss = jnp.mean(jnp.sum(v_mid ** 2, axis=-1))
 
-        # 2. Direction coherence — FIX: normalise per sample
-        v_early = z4 - z2                                          # (B, D)
-        v_full  = z6 - z2                                          # (B, D)
-        norm_early = jnp.sqrt(jnp.sum(v_early ** 2, axis=-1, keepdims=True) + 1e-8)
-        norm_full  = jnp.sqrt(jnp.sum(v_full  ** 2, axis=-1, keepdims=True) + 1e-8)
+        # 2. Direction coherence — normalise per sample safely
+        v_early = model.manifold.log_map(z2, z4)                   # (B, D)
+        v_full  = v_2to6                                           # (B, D)
+        norm_early = safe_norm(v_early, keepdims=True)
+        norm_full  = safe_norm(v_full, keepdims=True)
         v_en    = v_early / norm_early
         v_fn    = v_full  / norm_full
         dir_loss = jnp.mean(1.0 - jnp.sum(v_en * v_fn, axis=-1))  # (B,) → scalar
@@ -229,15 +241,17 @@ def cyclic_beta(epoch: int, cycle_len: int = 20,
 
 class AnnealedKLLoss(LossComponent):
     """KL loss whose weight is provided dynamically via __call__."""
+    beta: float
 
     def __init__(self, beta_max: float = 5e-4):
         super().__init__(beta_max, "AnnealedKL")
+        self.beta = 0.0
 
-    def __call__(self, model, batch, key, beta: float = 0.0):
+    def __call__(self, model, batch, key):
         x    = batch[0]
         v_get_dist = eqx.filter_vmap(model._get_dist)
         dist = v_get_dist(x)
-        return jnp.mean(dist.kl_divergence_std_normal()) * beta
+        return jnp.mean(dist.kl_divergence_std_normal()) * self.beta
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -283,9 +297,6 @@ class VelocityConsistencyLoss(LossComponent):
     def __call__(self, model, batch, key):
         x_i, x_j = batch[0], batch[1]  # KNN neighbors
         u_i, u_j = batch[2], batch[3]  # their velocities
-        
-        def safe_norm(v):
-            return jnp.sqrt(jnp.sum(v ** 2, axis=-1) + 1e-8)
         
         # Only for pairs with similar velocity directions
         cos_sim_data = jnp.sum(u_i * u_j, axis=-1) / (safe_norm(u_i) * safe_norm(u_j))
@@ -408,7 +419,7 @@ def attach_pullback_metric(vae, key: jax.Array):
     decoder's Jacobian defines the metric for evaluation and geodesics.
     """
     manifold = vae.manifold
-    metric   = PullbackRiemannian(manifold, decoder=vae.decoder_net, key=key)
+    metric   = PullbackRiemannian(manifold, decoder=vae.decoder_net)
     return eqx.tree_at(lambda m: m.metric, vae, metric)
 
 
@@ -448,10 +459,9 @@ def train_vae(
     cls_weight: float = 0.15,
     vel_weight: float = 1.0,
 ):
-    data_dim   = dataset.X.shape[0] if hasattr(dataset.X, "shape") else dataset.X.shape[1]
-    # Defensive: handle (cells, features) layout
-    if len(dataset.X.shape) == 2:
-        data_dim = dataset.X.shape[1]
+    if dataset.X.ndim != 2:
+        raise ValueError(f"Expected 2D array (cells × features), got shape {dataset.X.shape}")
+    data_dim = dataset.X.shape[1]
 
     print(f"Building VAE: data_dim={data_dim}, latent_dim={latent_dim}, "
           f"n_types={n_cell_types}")
@@ -478,7 +488,7 @@ def train_vae(
     # ── JIT-compiled step ─────────────────────────────────────────────────────
     @eqx.filter_jit
     def train_step(diff, static, opt_state, batch_main, batch_trip, batch_vel,
-                   beta: float, step_key: jax.Array):
+                   kl_loss, step_key: jax.Array):
         def total_loss(dm):
             full = eqx.combine(dm, static)
             k1, k2, k3, k4, k5, k6 = jax.random.split(step_key, 6)
@@ -486,7 +496,7 @@ def train_vae(
             # batch_main: (x, v, labels, x_day4, x_day6)
             l_recon = recon_loss(full, batch_main, k1)
 
-            l_kl    = kl_loss(full, batch_main, k2, beta=beta)
+            l_kl    = kl_loss(full, batch_main, k2)
 
             l_cls   = cls_loss(full, batch_main, k3)
             l_coh   = coh_loss(full, batch_main, k4)
@@ -517,6 +527,7 @@ def train_vae(
 
     for epoch in range(epochs):
         beta = cyclic_beta(epoch, kl_cycle_len, 0.0, kl_beta_max)
+        kl_loss = eqx.tree_at(lambda l: l.beta, kl_loss, beta)
         key, sk = jax.random.split(key)
 
         # Shuffle main data
@@ -572,7 +583,7 @@ def train_vae(
             sk, step_key = jax.random.split(sk)
             diff_model, opt_state, loss, stats = train_step(
                 diff_model, static_model, opt_state,
-                batch_main, batch_trip, batch_vel, beta, step_key
+                batch_main, batch_trip, batch_vel, kl_loss, step_key
             )
 
             ep_stats["total"] += float(loss)
@@ -638,8 +649,7 @@ def compute_pullback_det(vae, Z: np.ndarray, n_grid: int = 20) -> tuple:
     # Project back to full latent dim via PCA inverse
     latent_dim = Z.shape[1]
     pts_full   = pca2.inverse_transform(pts2d).astype(np.float32)
-    # Clip to latent_dim
-    pts_full   = pts_full[:, :latent_dim]
+    assert pts_full.shape[1] == latent_dim, f"Shape mismatch: {pts_full.shape[1]} != {latent_dim}"
 
     @eqx.filter_jit
     def logdet_at(v_mod, z):
@@ -855,7 +865,7 @@ def plot_diagnostics(
 
     # ── Print key metrics ─────────────────────────────────────────────────────
     print("\n─── Latent space quality metrics ───")
-    knn_score = knn_preservation_score(Z, X_pca[:, :Z.shape[1]], k=15)
+    knn_score = knn_preservation_score(Z, X_pca, k=15)
     print(f"  KNN preservation (k=15): {knn_score:.3f}  "
           f"(>0.6 is good; measures local topology)")
 
@@ -927,6 +937,7 @@ def main():
     # (velocity has zero mean by construction; subtracting mean again
     # would shift it incorrectly — divide by std only)
     V_pca_n = (V_pca / (scaler.scale_ + 1e-8)).astype(np.float32)
+    joblib.dump(scaler, "data/weinreb_scaler.joblib")
     print(f"  X_pca range after scaling: [{X_pca_n.min():.2f}, {X_pca_n.max():.2f}]")
 
     print(f"Cells: {X_pca.shape[0]}  |  PCA dims: {X_pca.shape[1]}  |  "

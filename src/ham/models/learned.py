@@ -46,13 +46,11 @@ class PullbackRanders(Randers):
     A Randers Metric where H(z) is strictly defined by the Decoder's 
     geometry (Pullback Metric), and only the Wind W(z) is learned.
     """
-    decoder: eqx.Module # Pass the frozen decoder here
     dim: int = eqx.field(static=True)
     use_wind: bool = eqx.field(static=True, default=True)
 
     def __init__(self, manifold, decoder, key, hidden_dim=64, depth=3, use_fourier=False, fourier_scale=1.0, use_wind=True):
         self.dim = int(manifold.ambient_dim)
-        self.decoder = decoder
         self.use_wind = bool(use_wind)
         
         # We only need the VectorField for the Wind.
@@ -72,41 +70,30 @@ class KernelWindField(eqx.Module):
     """
     anchors_z: Any
     anchors_v: Any
-    sigma: Any
+    sigma: float = eqx.field(static=True)
 
     def __init__(self, anchors_z, anchors_v, sigma=0.5):
         self.anchors_z = anchors_z
         self.anchors_v = anchors_v
-        self.sigma = sigma
+        self.sigma = float(sigma)
 
     def __call__(self, z: jax.Array) -> jax.Array:
-        # Optimized distance calculation for vmap scaling: (a-b)^2 = a^2 + b^2 - 2ab
-        # Instead of (anchors - z)**2 which materializes a (B, N, D) array when vmapped over B queries.
-        z_sq = jnp.sum(z**2, axis=-1, keepdims=True)
-        anchors_sq = jnp.sum(self.anchors_z**2, axis=-1)
-        dots = jnp.dot(self.anchors_z, z.T).T if z.ndim > 0 else jnp.dot(self.anchors_z, z)
-        
-        # dists_sq = z_sq + anchors_sq - 2 * z @ anchors.T
-        if z.ndim > 0:
-            dists_sq = z_sq + anchors_sq - 2 * dots
-        else:
-            dists_sq = z_sq + anchors_sq - 2 * dots
-            
-        weights = jax.nn.softmax(-dists_sq / (2 * self.sigma**2))
-        return jnp.dot(weights, self.anchors_v)
+        # z: (D,), anchors_z: (N, D)
+        diff = self.anchors_z - z[None, :]          # (N, D)
+        dists_sq = jnp.sum(diff ** 2, axis=-1)      # (N,)
+        weights = jax.nn.softmax(-dists_sq / (2 * self.sigma ** 2))   # (N,)
+        return jnp.dot(weights, self.anchors_v)      # (D,)
 
 class DataDrivenPullbackRanders(Randers):
     """
     Instead of a parameterized neural network, uses a kernel smoother
     over the dataset's exact RNA velocities projected into the latent space.
     """
-    decoder: Any
     dim: int = eqx.field(static=True)
     use_wind: bool = eqx.field(static=True, default=True)
 
     def __init__(self, manifold, decoder, anchors_z, anchors_v, sigma=0.5, use_wind=True):
         self.dim = int(manifold.ambient_dim)
-        self.decoder = decoder
         self.use_wind = bool(use_wind)
         h_net = PullbackGNet(decoder=decoder, dim=self.dim)
         w_net = KernelWindField(anchors_z, anchors_v, sigma)
@@ -121,19 +108,18 @@ class PullbackGNet(eqx.Module):
     def __call__(self, z: jax.Array) -> jax.Array:
         J = jax.jacfwd(self.decoder)(z)
         H = jnp.dot(J.T, J)
-        # Add a tiny diagonal for numerical stability
-        return H + 1e-4 * jnp.eye(self.dim)
+        # Add a tiny diagonal for numerical stability and scale down to prevent
+        # extreme causality squashing when eigenvalues are large.
+        return (H + 1e-4 * jnp.eye(self.dim)) * 1e-4
 
-class PullbackRiemannian(Riemannian, eqx.Module):
+class PullbackRiemannian(Riemannian):
     """
     A Riemannian Metric where G(z) is strictly defined by the Decoder's 
     geometry (Pullback Metric).
     """
-    decoder: eqx.Module # Pass the frozen decoder here
     dim: int = eqx.field(static=True)
 
-    def __init__(self, manifold: Manifold, decoder: eqx.Module, key: jax.Array = None, hidden_dim: int = 32):
+    def __init__(self, manifold: Manifold, decoder: eqx.Module, hidden_dim: int = 32):
         self.dim = manifold.ambient_dim
-        self.decoder = decoder
         g_net = PullbackGNet(decoder=decoder, dim=self.dim)
         super().__init__(manifold, g_net)

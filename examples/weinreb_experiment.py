@@ -210,12 +210,13 @@ def attach_datadriven_randers_metric(vae: GeometricVAE, dataset: BioDataset, n_a
     V_sample = V_valid[idx]
     
     # 3. Project to latent space using the encoder's Jacobian
-    @jax.vmap
-    def get_latent_vel(x, u):
-        return vae.project_control(x, u)
+    @eqx.filter_jit
+    @eqx.filter_vmap(in_axes=(None, 0, 0))
+    def get_latent_vel(model, x, u):
+        return model.project_control(x, u)
     
     print(f"  Projecting {n_sample} dataset velocities to latent space anchors...")
-    z_anchors, v_anchors = get_latent_vel(X_sample, V_sample)
+    z_anchors, v_anchors = get_latent_vel(vae, X_sample, V_sample)
     
     # 4. Attach Metric
     metric = DataDrivenPullbackRanders(vae.manifold, vae.decoder_net, z_anchors, v_anchors, sigma=sigma)
@@ -252,7 +253,8 @@ def encode_mean(model: GeometricVAE, x: jnp.ndarray) -> jnp.ndarray:
 def two_segment_energy(metric, z2, z4, z6):
     """
     Discrete action of path z2 → z4 → z6.
-    E = F(z2, z4-z2)² / 2  +  F(z4, z6-z4)² / 2
+    Returns metric.energy(z2, v24) + metric.energy(z4, v46)
+    where energy(z, v) = ½ F(z, v)² (if metric follows the standard convention).
     """
     return metric.energy(z2, z4 - z2) + metric.energy(z4, z6 - z4)
 
@@ -301,8 +303,7 @@ def run_validation(
     n_pairs: int = 1000,
 ) -> Tuple[Dict, Dict]:
 
-    riem_key      = jax.random.PRNGKey(77)
-    riemannian_vae = build_riemannian_baseline(randers_vae, riem_key)
+    riemannian_vae = build_riemannian_baseline(randers_vae)
 
     print("\nBuilding fate attractors ...")
     attractors = build_fate_attractors(
@@ -314,7 +315,8 @@ def run_validation(
         raise ValueError("Need ≥ 2 fate attractors for counterfactual test.")
 
     # Shuffle and subsample
-    rng = np.random.default_rng(int(key[0]))
+    seed = int(jax.random.randint(key, shape=(), minval=0, maxval=2**31 - 1))
+    rng  = np.random.default_rng(seed)
     n   = min(n_pairs, len(lineage_triples))
     idx = rng.choice(len(lineage_triples), n, replace=False)
     triples = np.array(lineage_triples)[idx]
@@ -338,26 +340,58 @@ def run_validation(
     fate_idx_map = {f: fate_names.index(f)
                     for f in target_fates if f in fate_names}
 
+    valid_idx = []
+    z6_cf_list = []
+    fates_list = []
+
     for i in range(n):
         obs_fidx = day6_labels[i]
         obs_fname = fate_names[obs_fidx] if obs_fidx < len(fate_names) else None
         if obs_fname not in target_fates or obs_fname not in attractors:
             continue
 
-        z2, z4, z6_obs = z2s[i], z4s[i], z6s[i]
+        z2 = z2s[i]
 
         # Hardest counterfactual: closest wrong-fate attractor to z2
         cf_candidates = [(fn, fz) for fn, fz in attractors.items()
                          if fn != obs_fname]
         if not cf_candidates:
             continue
+        
+        # Hardest counterfactual: the NEAREST wrong-fate attractor to z2.
+        # This is the most conservative test — if the metric discriminates even
+        # against the closest alternative fate, it is truly informative.
         z6_cf = min(cf_candidates,
                     key=lambda fz: float(jnp.linalg.norm(fz[1] - z2)))[1]
+        
+        valid_idx.append(i)
+        z6_cf_list.append(z6_cf)
+        fates_list.append(obs_fname)
 
-        for mname, model in [('randers', randers_vae),
-                              ('riemannian', riemannian_vae)]:
-            e_obs = float(two_segment_energy(model.metric, z2, z4, z6_obs))
-            e_cf  = float(two_segment_energy(model.metric, z2, z4, z6_cf))
+    if not valid_idx:
+        return results, raw
+
+    valid_idx = np.array(valid_idx)
+    z6_cf_arr = jnp.stack(z6_cf_list)
+    z2s_valid = z2s[valid_idx]
+    z4s_valid = z4s[valid_idx]
+    z6s_obs_valid = z6s[valid_idx]
+
+    @eqx.filter_jit
+    @eqx.filter_vmap(in_axes=(None, 0, 0, 0))
+    def batch_energy(metric, z2, z4, z6):
+        return two_segment_energy(metric, z2, z4, z6)
+
+    for mname, model in [('randers', randers_vae),
+                          ('riemannian', riemannian_vae)]:
+        
+        e_obs_all = np.array(batch_energy(model.metric, z2s_valid, z4s_valid, z6s_obs_valid))
+        e_cf_all = np.array(batch_energy(model.metric, z2s_valid, z4s_valid, z6_cf_arr))
+
+        for idx_eval in range(len(valid_idx)):
+            e_obs = float(e_obs_all[idx_eval])
+            e_cf = float(e_cf_all[idx_eval])
+            obs_fname = fates_list[idx_eval]
 
             if e_obs <= 0 or e_cf <= 0 or not np.isfinite(e_obs) or not np.isfinite(e_cf):
                 continue
@@ -424,8 +458,9 @@ def run_validation(
     return results, raw
 
 
-def build_riemannian_baseline(vae: GeometricVAE, key: jax.Array) -> GeometricVAE:
-    metric = PullbackRiemannian(vae.manifold, decoder=vae.decoder_net, key=key)
+def build_riemannian_baseline(vae: GeometricVAE) -> GeometricVAE:
+    # key unused; G=JᵀJ is deterministic
+    metric = PullbackRiemannian(vae.manifold, decoder=vae.decoder_net)
     return eqx.tree_at(lambda m: m.metric, vae, metric)
 
 

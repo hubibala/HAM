@@ -13,8 +13,8 @@ from ham.utils.math import safe_norm
 class TestSolver(unittest.TestCase):
     
     def setUp(self):
-        # AVBD Settings: beta=10 for stiffness, 200 iterations
-        self.solver = AVBDSolver(step_size=0.05, beta=10.0, iterations=200, tol=1e-6)
+        # AVBD Settings: 200 iterations
+        self.solver = AVBDSolver(step_size=0.05, iterations=200, tol=1e-6)
 
     def test_torus_topology(self):
         """
@@ -88,6 +88,34 @@ class TestSolver(unittest.TestCase):
         mid = traj.xs[10]
         print(f"\nParaboloid Midpoint Z: {mid[2]:.4f}")
         self.assertLess(mid[2], 0.2, "Path did not dip to follow surface.")
+
+    def test_rk4_ode(self):
+        """Test RK4 ODE integration for simple circular dynamics."""
+        # Simple harmonic oscillator / circular dynamics
+        def vector_field(z):
+            return jnp.array([-z[1], z[0]])
+            
+        z0 = jnp.array([1.0, 0.0])
+        step_size = 0.01
+        max_steps = int(jnp.pi * 2 / step_size)
+        
+        # RK4
+        def scan_fn(z, _):
+            k1 = vector_field(z)
+            k2 = vector_field(z + step_size/2 * k1)
+            k3 = vector_field(z + step_size/2 * k2)
+            k4 = vector_field(z + step_size * k3)
+            z_next = z + step_size/6 * (k1 + 2*k2 + 2*k3 + k4)
+            return z_next, z_next
+            
+        _, traj = jax.lax.scan(scan_fn, z0, jnp.arange(max_steps))
+        traj = jnp.concatenate([z0[None], traj], axis=0)
+        
+        # After 2*pi, we should be back at [1.0, 0.0]
+        final_pt = traj[-1]
+        error = jnp.linalg.norm(final_pt - z0)
+        print(f"\nRK4 Circular Dynamics Error: {error:.4e}")
+        self.assertLess(error, 1e-2, "RK4 Integration drifted too much on circle.")
 
 if __name__ == '__main__':
     unittest.main()

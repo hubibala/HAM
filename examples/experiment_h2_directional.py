@@ -24,54 +24,8 @@ from ham.models.learned import DataDrivenPullbackRanders
 from ham.solvers.avbd import AVBDSolver
 
 
-def load_phase1_vae(checkpoint, d_in, d_lat, n_cls, key):
-    """Minimal loader — adjust path if your builder is elsewhere."""
-    from weinreb_vae import build_diagnostic_vae   # Keep only this one external import
-    model = build_diagnostic_vae(d_in, d_lat, n_cls, key)
-    return eqx.tree_deserialise_leaves(checkpoint, model)
-
-
-def attach_datadriven_randers_metric(vae, dataset, n_anchors=2000, sigma=0.4, seed=42):
-    """Self-contained attachment."""
-    vel_norms = np.linalg.norm(np.array(dataset.V), axis=1)
-    valid_mask = vel_norms > 1e-6
-    X_valid = dataset.X[valid_mask]
-    V_valid = dataset.V[valid_mask]
-
-    rng = np.random.default_rng(seed)
-    n_sample = min(n_anchors, len(X_valid))
-    idx = rng.choice(len(X_valid), n_sample, replace=False)
-
-    X_sample = X_valid[idx]
-    V_sample = V_valid[idx]
-
-    @eqx.filter_jit
-    @eqx.filter_vmap(in_axes=(None, 0, 0))
-    def project_vel(v_mod, x, u):
-        return v_mod.project_control(x, u)
-
-    z_anchors, v_anchors = project_vel(vae, X_sample, V_sample)
-
-    metric = DataDrivenPullbackRanders(
-        manifold=vae.manifold,
-        decoder=vae.decoder_net,
-        anchors_z=z_anchors,
-        anchors_v=v_anchors,
-        sigma=sigma,
-        use_wind=True
-    )
-    return eqx.tree_at(lambda m: m.metric, vae, metric)
-
-
-def arc_length_forward_backward(metric, z_start, z_end, solver, steps=25):
-    """Forward and backward length on the SAME geodesic curve."""
-    traj = solver.solve(metric, z_start, z_end, n_steps=steps, train_mode=False)
-    xs = traj.xs
-
-    L_fwd = metric.arc_length(xs)
-    L_bwd = metric.arc_length(xs[::-1])   # reversed on same points
-
-    return float(L_fwd), float(L_bwd)
+import joblib
+from weinreb_experiment import load_phase1_vae, attach_datadriven_randers_metric
 
 
 def main():
@@ -80,13 +34,14 @@ def main():
     TEST_TRIPLES = "data/weinreb_test_triples.npy"
     LATENT_DIM   = 8
     MAX_PAIRS    = 800
+    CHUNK_SIZE   = 50   # BVP batch size; reduce if OOM, increase if GPU underutilised
 
     SIGMAS = [0.2, 0.4, 0.6]
     SEEDS  = [42, 101, 256, 1024, 2048]
 
     print("=" * 80)
     print("H2 - DIRECTIONAL ASYMMETRY (Short Observed Segments)")
-    print("Forward vs Backward length on the SAME geodesic for day2→day4 and day4→day6")
+    print("Forward vs Backward length on the SAME geodesic for day2->day4 and day4->day6")
     print("=" * 80)
 
     if not all(os.path.exists(p) for p in [CHECKPOINT, PREPROCESSED, TEST_TRIPLES]):
@@ -98,8 +53,8 @@ def main():
     X_pca = np.array(adata.obsm['X_pca'], dtype=np.float32)
     V_pca = np.array(adata.obsm['velocity_pca'], dtype=np.float32)
 
-    scaler = StandardScaler()
-    X_norm = scaler.fit_transform(X_pca).astype(np.float32)
+    scaler = joblib.load("data/weinreb_scaler.joblib")
+    X_norm = scaler.transform(X_pca).astype(np.float32)
     V_norm = (V_pca / (scaler.scale_ + 1e-8)).astype(np.float32)
 
     dataset = BioDataset(X=jnp.array(X_norm), V=jnp.array(V_norm),
@@ -143,32 +98,36 @@ def main():
             xs = traj.xs
             Lf = metric.arc_length(xs)
             Lb = metric.arc_length(xs[::-1])
-            return Lf, Lb
+            return Lf, Lb, traj.is_converged, traj.final_gradient
         return jax.vmap(single_pair)(zs_batch, ze_batch)
 
     sweep_results = {}
     for sigma in SIGMAS:
         per_sigma_ratios, per_sigma_pvals, per_sigma_fracs = [], [], []
         for seed in SEEDS:
-            vae = attach_datadriven_randers_metric(vae_base, dataset, n_anchors=2000, sigma=jnp.array(sigma), seed=seed)
+            vae = attach_datadriven_randers_metric(vae_base, dataset, n_anchors=2000, sigma=float(sigma))
 
             # ── Batch BVP Solving (Chunked for memory) ──────────────────────────────
             Z_starts = jnp.concatenate([Z2, Z4], axis=0) # (2*N, D)
             Z_ends   = jnp.concatenate([Z4, Z6], axis=0) # (2*N, D)
             
             n_total = Z_starts.shape[0]
-            chunk_size = 50  # Smaller chunks for faster first-result and lower memory
-            n_chunks = (n_total + chunk_size - 1) // chunk_size
-            print(f"  σ={sigma}, seed={seed}: solving {n_total} BVPs in {n_chunks} chunks of {chunk_size}...")
+            n_chunks = (n_total + CHUNK_SIZE - 1) // CHUNK_SIZE
+            print(f"  σ={sigma}, seed={seed}: solving {n_total} BVPs in {n_chunks} chunks of {CHUNK_SIZE}...")
             
             Lf_list, Lb_list = [], []
             
-            for ci, i in enumerate(range(0, n_total, chunk_size)):
-                zs_chunk = Z_starts[i:i+chunk_size]
-                ze_chunk = Z_ends[i:i+chunk_size]
-                L_fwd_c, L_bwd_c = batch_arc_lengths(vae.metric, zs_chunk, ze_chunk)
+            for ci, i in enumerate(range(0, n_total, CHUNK_SIZE)):
+                zs_chunk = Z_starts[i:i+CHUNK_SIZE]
+                ze_chunk = Z_ends[i:i+CHUNK_SIZE]
+                L_fwd_c, L_bwd_c, conv_c, grad_c = batch_arc_lengths(vae.metric, zs_chunk, ze_chunk)
                 Lf_list.append(np.array(L_fwd_c))
                 Lb_list.append(np.array(L_bwd_c))
+                
+                not_conv = np.sum(~np.array(conv_c))
+                if not_conv > 0:
+                    print(f"    [Warning] {not_conv}/{len(conv_c)} trajectories did not converge! Max grad: {np.max(np.array(grad_c)):.4f}")
+
                 print(f"    chunk {ci+1}/{n_chunks} done ({i+len(zs_chunk)}/{n_total} pairs)", flush=True)
 
             Lf = np.concatenate(Lf_list)

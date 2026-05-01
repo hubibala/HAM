@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 import anndata
-from sklearn.preprocessing import StandardScaler
+import joblib
 
 # Add examples dir to sys.path so we can import from weinreb_vae.py
 sys.path.insert(0, os.path.dirname(__file__))
@@ -54,8 +54,8 @@ def main():
     labels_np  = ct_series.cat.codes.values.astype(np.int32)
     n_types    = len(fate_names)
 
-    scaler  = StandardScaler()
-    X_pca_n = scaler.fit_transform(X_pca).astype(np.float32)
+    scaler  = joblib.load("data/weinreb_scaler.joblib")
+    X_pca_n = scaler.transform(X_pca).astype(np.float32)
     V_pca_n = (V_pca / (scaler.scale_ + 1e-8)).astype(np.float32)
 
     lineage_triples = np.load(triples_path).astype(np.int32)

@@ -13,6 +13,8 @@ class Trajectory(NamedTuple):
     vs: jnp.ndarray
     energy: jnp.ndarray
     constraint_violation: jnp.ndarray
+    is_converged: jnp.ndarray
+    final_gradient: jnp.ndarray
 
 class SolverState(NamedTuple):
     path: jnp.ndarray          # Inner points (T-2, D)
@@ -23,6 +25,7 @@ class SolverState(NamedTuple):
     max_violation: float
     prev_energy: float
     curr_energy: float
+    max_gradient: float
 
 class AVBDSolver(eqx.Module):
     """
@@ -34,17 +37,13 @@ class AVBDSolver(eqx.Module):
 
     Attributes:
         step_size: Gradient descent learning rate for inner path points.
-        beta: Penalty stiffness coefficient for equality constraints.
         iterations: Number of full relaxation passes per solve.
         tol: Tolerance for convergence (gradient norm).
-        momentum: Momentum factor for descent updates.
         energy_tol: Tolerance for convergence (energy change).
     """
-    step_size: float = 0.05
-    beta: float = 10.0
-    iterations: int = 20
+    step_size: float = 0.004  # effective rate is step_size/2 due to shared segment counting
+    iterations: int = 150
     tol: float = 1e-4
-    momentum: float = 0.5
     energy_tol: float = 1e-4
 
     def solve(self, metric: FinslerMetric, 
@@ -94,7 +93,8 @@ class AVBDSolver(eqx.Module):
             step=0,
             max_violation=1.0,
             prev_energy=jnp.inf,
-            curr_energy=0.0
+            curr_energy=0.0,
+            max_gradient=jnp.inf
         )
 
         # 2. Define the discrete Action (Energy) locally
@@ -136,7 +136,7 @@ class AVBDSolver(eqx.Module):
             # Prevent exploding gradients by clipping the norm
 
             grad_norm = safe_norm(grad_tan)
-            clip_value = 10.0
+            clip_value = 2.0
             grad_tan = jnp.where(grad_norm > clip_value, grad_tan * (clip_value / grad_norm), grad_tan)
             
             # Update Step (with Momentum if needed, simplified here for stability)
@@ -144,7 +144,7 @@ class AVBDSolver(eqx.Module):
             step = -self.step_size * grad_tan
             x_new = metric.manifold.retract(x, step)
             
-            return x_new
+            return x_new, grad_norm
 
         # 4. The Loop Body
         def step_fn(s: SolverState, _):
@@ -159,10 +159,10 @@ class AVBDSolver(eqx.Module):
             
             # Scan over vertices to update them
             def scan_body(curr_path_full, idx):
-                new_node = update_vertex(curr_path_full, idx - 1, s)
-                return curr_path_full.at[idx].set(new_node), None
+                new_node, grad_norm = update_vertex(curr_path_full, idx - 1, s)
+                return curr_path_full.at[idx].set(new_node), grad_norm
 
-            new_full, _ = jax.lax.scan(scan_body, full_path, full_order)
+            new_full, grad_norms = jax.lax.scan(scan_body, full_path, full_order)
             new_inner = new_full[1:-1]
             
             # Dual Updates (Constraints)
@@ -181,7 +181,8 @@ class AVBDSolver(eqx.Module):
                 step=s.step + 1,
                 max_violation=0.0,
                 prev_energy=s.curr_energy,
-                curr_energy=total_E
+                curr_energy=total_E,
+                max_gradient=jnp.max(grad_norms)
             ), None
 
         # 5. Execution Strategy
@@ -190,7 +191,12 @@ class AVBDSolver(eqx.Module):
             final_state, _ = jax.lax.scan(step_fn, state, None, length=self.iterations)
         else:
             # While loop (convergence based, strictly for inference)
-            def cond(s): return s.step < self.iterations # Simplify for now
+            def cond(s):
+                not_converged = s.max_gradient > self.tol
+                not_energy_converged = jnp.abs(s.curr_energy - s.prev_energy) > self.energy_tol
+                under_limit = s.step < self.iterations
+                return under_limit & (not_converged | not_energy_converged)
+
             final_state = jax.lax.while_loop(cond, lambda s: step_fn(s, None)[0], state)
 
         # 6. Output
@@ -201,5 +207,7 @@ class AVBDSolver(eqx.Module):
             xs=full_path,
             vs=velocities,
             energy=final_state.curr_energy,
-            constraint_violation=final_state.max_violation
+            constraint_violation=final_state.max_violation,
+            is_converged=(final_state.max_gradient <= self.tol),
+            final_gradient=final_state.max_gradient
         )

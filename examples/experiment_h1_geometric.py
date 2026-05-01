@@ -4,7 +4,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import StandardScaler
+import joblib
+from weinreb_experiment import load_phase1_vae
 import jax
 import equinox as eqx
 import anndata
@@ -30,16 +31,10 @@ def main():
     fate_names = list(adata.obs['Cell type annotation'].cat.categories)
     n_types = len(fate_names)
 
-    # Note: X_pca is already unit-variance scaled via preprocess_weinreb.py
-    # but the VAE diagnostic used standard scaler originally. Let's replicate exact inputs:
-    scaler = StandardScaler()
-    X_norm = scaler.fit_transform(X_pca).astype(np.float32)
+    scaler = joblib.load("data/weinreb_scaler.joblib")
+    X_norm = scaler.transform(X_pca).astype(np.float32)
 
     from weinreb_vae import build_diagnostic_vae, encode_all, compute_pullback_det, knn_preservation_score, TARGET_FATES
-
-    def load_phase1_vae(checkpoint, d_in, d_lat, n_cls, k):
-        model = build_diagnostic_vae(d_in, d_lat, n_cls, k)
-        return eqx.tree_deserialise_leaves(checkpoint, model)
 
     print("Loading VAE...")
     key = jax.random.PRNGKey(42)

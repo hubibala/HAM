@@ -13,12 +13,8 @@ from ham.solvers.avbd import AVBDSolver
 
 from weinreb_vae import build_diagnostic_vae, encode_all, TARGET_FATES
 
-# Reuse the datadriven attachment from the main experiment module
-from weinreb_experiment import attach_datadriven_randers_metric
-
-def load_phase1_vae(checkpoint, d_in, d_lat, n_cls, k):
-    model = build_diagnostic_vae(d_in, d_lat, n_cls, k)
-    return eqx.tree_deserialise_leaves(checkpoint, model)
+import joblib
+from weinreb_experiment import attach_datadriven_randers_metric, load_phase1_vae
 
 def build_riemannian_fallback(vae: GeometricVAE) -> GeometricVAE:
     """
@@ -42,7 +38,7 @@ def arc_length_normalized(metric, z_start, z_end, solver, steps=20):
     the Euclidean length of the same path (not the chord between endpoints).
     """
     # Solve for the ACTUAL geodesic
-    trajectory = solver.solve(metric, z_start, z_end, n_steps=steps, train_mode=False)
+    trajectory = solver.solve(metric, z_start, z_end, n_steps=steps, train_mode=True)
     
     # Integrated Finsler Length along the geodesic
     finsler_len = metric.arc_length(trajectory.xs)
@@ -53,17 +49,12 @@ def arc_length_normalized(metric, z_start, z_end, solver, steps=20):
     
     return finsler_len / (eucl_path_len + 1e-8)
 
-def two_segment_normalized_cost(metric, z2, z4, z6, solver):
-    cost_1 = arc_length_normalized(metric, z2, z4, solver)
-    cost_2 = arc_length_normalized(metric, z4, z6, solver)
-    return cost_1 + cost_2
-
 def geodesic_proximity(metric, z_start, z_end, z_target, solver, steps=20):
     """
     Computes how close the geodesic z_start -> z_end passes to z_target.
     Returns the minimum Euclidean distance.
     """
-    trajectory = solver.solve(metric, z_start, z_end, n_steps=steps, train_mode=False)
+    trajectory = solver.solve(metric, z_start, z_end, n_steps=steps, train_mode=True)
     # trajectory.xs is (N, D)
     dists = jnp.linalg.norm(trajectory.xs - z_target, axis=-1)
     return jnp.min(dists)
@@ -110,8 +101,8 @@ def main():
     adata = anndata.read_h5ad(PREPROCESSED)
     X_pca = np.array(adata.obsm['X_pca'], dtype=np.float32)
     V_pca = np.array(adata.obsm['velocity_pca'], dtype=np.float32)
-    scaler = StandardScaler()
-    X_norm = scaler.fit_transform(X_pca).astype(np.float32)
+    scaler = joblib.load("data/weinreb_scaler.joblib")
+    X_norm = scaler.transform(X_pca).astype(np.float32)
     V_norm = (V_pca / (scaler.scale_ + 1e-8)).astype(np.float32)
     labels = adata.obs['Cell type annotation'].cat.codes.values.astype(np.int32)
     fate_names = list(adata.obs['Cell type annotation'].cat.categories)
@@ -165,6 +156,9 @@ def main():
         z2 = z2s[i]
         cf_candidates = [(fn, fz) for fn, fz in attractors.items() if fn != obs_fname]
         if not cf_candidates: continue
+        # Hardest counterfactual: the NEAREST wrong-fate attractor to z2.
+        # This is the most conservative test — if the metric discriminates even
+        # against the closest alternative fate, it is truly informative.
         z6_cf = min(cf_candidates, key=lambda fz: float(jnp.linalg.norm(fz[1] - z2)))[1]
         valid_idxs.append(i)
         valid_z6_cfs.append(z6_cf)
@@ -178,9 +172,11 @@ def main():
     bz6_obss = jnp.stack([z6s[i] for i in valid_idxs])
     bz6_cfs = jnp.stack(valid_z6_cfs)
 
+    solver = AVBDSolver(iterations=20)
+
     @eqx.filter_jit
-    @eqx.filter_vmap(in_axes=(None, None, 0, 0, 0, 0, None))
-    def batch_eval(m_rand, m_riem, z2, z4, z6_obs, z6_cf, solver):
+    @eqx.filter_vmap(in_axes=(None, None, 0, 0, 0, 0))
+    def batch_eval(m_rand, m_riem, z2, z4, z6_obs, z6_cf):
         # 1. Energy Discriminative Test (z2 -> z4 -> z6)
         e_obs_rand = arc_length_normalized(m_rand, z2, z6_obs, solver)
         e_cf_rand = arc_length_normalized(m_rand, z2, z6_cf, solver)
@@ -193,8 +189,7 @@ def main():
         
         return jnp.array([e_obs_rand, e_cf_rand, e_obs_riem, e_cf_riem, prox_rand, prox_riem])
         
-    solver = AVBDSolver(iterations=20)
-    output = batch_eval(vae_randers.metric, vae_riemannian.metric, bz2s, bz4s, bz6_obss, bz6_cfs, solver)
+    output = batch_eval(vae_randers.metric, vae_riemannian.metric, bz2s, bz4s, bz6_obss, bz6_cfs)
 
     output = np.array(output)
     
